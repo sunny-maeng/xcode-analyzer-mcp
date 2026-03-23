@@ -7,6 +7,7 @@ import { detectUnusedImports } from "./analyzers/unused-imports.js";
 import { analyzeDependencyTree } from "./analyzers/dependency-tree.js";
 import { analyzeLargeFiles } from "./analyzers/large-files.js";
 import { analyzeRetainCycles } from "./analyzers/retain-cycle.js";
+import { fixRetainCycles } from "./analyzers/retain-cycle-fixer.js";
 
 export function createServer(): McpServer {
   const server = new McpServer({
@@ -254,6 +255,48 @@ export function createServer(): McpServer {
         const result = await analyzeRetainCycles({
           projectPath,
           targetPaths: targetPaths ?? undefined,
+          excludePatterns: excludePatterns ?? [],
+        });
+        return { content: [{ type: "text", text: result }] };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // Tool 8: Auto-fix Retain Cycles
+  server.tool(
+    "fix_retain_cycles",
+    "Automatically fix common retain cycle patterns: add `weak` to delegates, add `[weak self]` + `guard let self` to closures, add `removeObserver` in deinit. Defaults to dry-run mode (preview only). Set dryRun to false to apply changes.",
+    {
+      projectPath: z.string().describe("Path to the Xcode project root directory"),
+      targetPaths: z
+        .array(z.string())
+        .optional()
+        .describe("Specific files/directories to fix (default: entire project)"),
+      dryRun: z
+        .boolean()
+        .optional()
+        .describe("Preview changes without modifying files (default: true)"),
+      categories: z
+        .array(z.enum(["strong-delegate", "weak-self", "notification-leak"]))
+        .optional()
+        .describe("Which fix categories to apply (default: all)"),
+      excludePatterns: z
+        .array(z.string())
+        .optional()
+        .describe("Glob patterns to exclude"),
+    },
+    async ({ projectPath, targetPaths, dryRun, categories, excludePatterns }) => {
+      try {
+        const result = await fixRetainCycles({
+          projectPath,
+          targetPaths: targetPaths ?? undefined,
+          dryRun: dryRun ?? true,
+          categories: categories ?? ["strong-delegate", "weak-self", "notification-leak"],
           excludePatterns: excludePatterns ?? [],
         });
         return { content: [{ type: "text", text: result }] };
