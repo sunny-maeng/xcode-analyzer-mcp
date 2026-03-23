@@ -52,7 +52,7 @@ export async function fixRetainCycles(options: FixOptions): Promise<string> {
       const fixes: FixResult[] = [];
 
       if (categories.includes("strong-delegate")) {
-        const result = fixStrongDelegates(modified, relativePath);
+        const result = fixStrongDelegates(modified, relativePath, buildLineScopes(modified.split("\n")));
         modified = result.source;
         fixes.push(...result.fixes);
       }
@@ -84,12 +84,49 @@ export async function fixRetainCycles(options: FixOptions): Promise<string> {
   return formatFixResult(allFixes, modifiedFiles, dryRun);
 }
 
+type TypeKind = "class" | "struct" | "enum" | "protocol" | "actor" | "extension" | null;
+
+/**
+ * Build a per-line map of which type scope each line belongs to.
+ */
+function buildLineScopes(lines: string[]): TypeKind[] {
+  const scopes: TypeKind[] = new Array(lines.length).fill(null);
+  const stack: { kind: TypeKind; braceDepth: number }[] = [];
+  let braceDepth = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith("//")) {
+      scopes[i] = stack.length > 0 ? stack[stack.length - 1].kind : null;
+      continue;
+    }
+    const typeMatch = trimmed.match(/\b(class|struct|enum|protocol|actor|extension)\s+\w+/);
+    if (typeMatch && trimmed.includes("{")) {
+      const kind = typeMatch[1] as TypeKind;
+      stack.push({ kind, braceDepth });
+    }
+    for (const ch of trimmed) {
+      if (ch === "{") braceDepth++;
+      if (ch === "}") {
+        braceDepth--;
+        if (stack.length > 0 && braceDepth === stack[stack.length - 1].braceDepth) {
+          stack.pop();
+        }
+      }
+    }
+    scopes[i] = stack.length > 0 ? stack[stack.length - 1].kind : null;
+  }
+  return scopes;
+}
+
 /**
  * Fix: Add `weak` to delegate/dataSource properties.
+ * Only applies to properties inside class/actor — NOT struct (struct can't have retain cycles).
  */
 function fixStrongDelegates(
   source: string,
   filePath: string,
+  lineScopes: TypeKind[],
 ): { source: string; fixes: FixResult[] } {
   const fixes: FixResult[] = [];
   const lines = source.split("\n");
@@ -103,6 +140,8 @@ function fixStrongDelegates(
     if (/\{\s*get\s*(set\s*)?\}/.test(trimmed)) continue;
     if (/\{\s*(return\s|self\b)/.test(trimmed)) continue;
     if (trimmed.includes("weak ") || trimmed.includes("unowned ")) continue;
+    // Only fix inside class/actor — struct delegates don't need weak
+    if (lineScopes[i] !== "class" && lineScopes[i] !== "actor") continue;
 
     // Match: var delegate: SomeType? or var dataSource: SomeType?
     const match = trimmed.match(
@@ -144,16 +183,15 @@ function fixMissingWeakSelf(
   const fixes: FixResult[] = [];
   const lines = source.split("\n");
 
-  // Escaping closure patterns that need [weak self]
+  // ── Allowlist: ONLY fix patterns known to cause retain cycles ──
   const escapingPatterns = [
+    // RxSwift subscriptions — the most common source of retain cycles
     /\.(subscribe|bind|drive|observe)\s*\(\s*onNext:\s*\{$/,
     /\.(subscribe|bind|drive|observe)\s*\{$/,
     /\.(subscribe|bind|drive)\s*\(\s*onNext:\s*\{\s*$/,
+    // Stored completion handlers
     /completion\s*:\s*\{$/,
     /completionHandler\s*:\s*\{$/,
-    /DispatchQueue\.\w+\.async\s*\{$/,
-    /DispatchQueue\.\w+\.asyncAfter.*\{$/,
-    /UIView\.animate.*\{$/,
   ];
 
   for (let i = 0; i < lines.length; i++) {

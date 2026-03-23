@@ -55,22 +55,67 @@ export async function analyzeRetainCycles(options: RetainCycleOptions): Promise<
   return formatResult(allIssues, swiftFiles.length);
 }
 
+type TypeKind = "class" | "struct" | "enum" | "protocol" | "actor" | "extension" | null;
+
+/**
+ * Build a per-line map of which type scope each line belongs to.
+ * Returns an array where lineScopes[i] = the TypeKind of the enclosing type at line i.
+ * Handles nested types by tracking brace depth per type declaration.
+ */
+function buildLineScopes(lines: string[]): TypeKind[] {
+  const scopes: TypeKind[] = new Array(lines.length).fill(null);
+  const stack: { kind: TypeKind; braceDepth: number }[] = [];
+  let braceDepth = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith("//")) {
+      scopes[i] = stack.length > 0 ? stack[stack.length - 1].kind : null;
+      continue;
+    }
+
+    // Detect type declarations
+    const typeMatch = trimmed.match(
+      /\b(class|struct|enum|protocol|actor|extension)\s+\w+/,
+    );
+    if (typeMatch && trimmed.includes("{")) {
+      const kind = typeMatch[1] as TypeKind;
+      stack.push({ kind, braceDepth });
+    }
+
+    // Count braces
+    for (const ch of trimmed) {
+      if (ch === "{") braceDepth++;
+      if (ch === "}") {
+        braceDepth--;
+        // Check if we're closing the current type scope
+        if (stack.length > 0 && braceDepth === stack[stack.length - 1].braceDepth) {
+          stack.pop();
+        }
+      }
+    }
+
+    scopes[i] = stack.length > 0 ? stack[stack.length - 1].kind : null;
+  }
+
+  return scopes;
+}
+
 function analyzeFile(source: string, filePath: string): RetainIssue[] {
   const issues: RetainIssue[] = [];
   const lines = source.split("\n");
 
-  // Pre-check: is this a class? (structs don't have retain cycles)
-  const isClass = /\bclass\s+\w+/.test(source);
-  // Check if this file is a protocol definition (protocol properties are not stored)
-  const isProtocol = /\bprotocol\s+\w+/.test(source);
+  // Build per-line type scope map (class vs struct vs protocol etc.)
+  const lineScopes = buildLineScopes(lines);
+  const hasClass = lineScopes.some((s) => s === "class" || s === "actor");
 
-  issues.push(...detectStrongSelfInClosures(lines, filePath, isClass));
-  issues.push(...detectStrongDelegates(lines, filePath, isProtocol));
+  issues.push(...detectStrongSelfInClosures(lines, filePath, lineScopes));
+  issues.push(...detectStrongDelegates(lines, filePath, lineScopes));
   issues.push(...detectTimerRetainCycles(lines, filePath));
   issues.push(...detectNotificationCenterLeaks(lines, filePath));
-  issues.push(...detectViewModelRetainCycles(lines, filePath, source, isProtocol));
+  issues.push(...detectViewModelRetainCycles(lines, filePath, source, lineScopes));
   issues.push(...detectDispatchWorkRetainCycles(lines, filePath));
-  issues.push(...detectStrongClosureProperties(lines, filePath, isClass));
+  issues.push(...detectStrongClosureProperties(lines, filePath, lineScopes));
 
   return issues;
 }
@@ -92,9 +137,10 @@ function isComputedOrProtocolProperty(line: string): boolean {
  * Detect closures that capture self without [weak self].
  * Checks: escaping closures, completion handlers, network callbacks, rx subscriptions
  */
-function detectStrongSelfInClosures(lines: string[], filePath: string, isClass: boolean): RetainIssue[] {
+function detectStrongSelfInClosures(lines: string[], filePath: string, lineScopes: TypeKind[]): RetainIssue[] {
   const issues: RetainIssue[] = [];
-  if (!isClass) return issues;
+  // Only classes/actors have retain cycles with self
+  if (!lineScopes.some((s) => s === "class" || s === "actor")) return issues;
 
   let inBlockComment = false;
   let braceDepth = 0;
@@ -119,27 +165,21 @@ function detectStrongSelfInClosures(lines: string[], filePath: string, isClass: 
 
     const trimmed = line.trim();
 
-    // Detect escaping closure patterns
+    // ── Allowlist approach ──
+    // ONLY flag patterns that are KNOWN to retain closures and cause real retain cycles.
+    // Everything else is assumed safe. This way new APIs don't require updates.
     const escapingPatterns = [
-      // RxSwift subscribe/bind/drive
-      /\.(subscribe|bind|drive|observe|do|map|flatMap|compactMap|filter|withLatestFrom|combineLatest)\s*\(\s*onNext:?\s*\{/,
+      // RxSwift/RxCocoa — subscriptions hold closures until disposed (the #1 source of retain cycles)
+      /\.(subscribe|bind|drive|observe)\s*\(\s*onNext:?\s*\{/,
       /\.(subscribe|bind|drive|observe)\s*\{/,
-      // Completion handlers
+      // Explicit @escaping annotation — developer marked it as escaping
+      /@escaping/,
+      // Stored completion/handler params — these closures outlive the call site
       /completion\s*:\s*\{/,
       /completionHandler\s*:\s*\{/,
-      /handler\s*:\s*\{/,
-      // Network/async callbacks
+      // Network callbacks — closures retained until response arrives
       /\.dataTask\s*\(.*\{/,
-      /\.request\s*\(.*\{/,
-      /URLSession.*\{/,
-      // DispatchQueue
-      /DispatchQueue\.\w+\.async(?:After)?\s*.*\{/,
-      // UIView.animate
-      /UIView\.animate.*\{/,
-      // NotificationCenter
-      /\.addObserver\(.*selector.*\)/,
-      // Custom escaping closures
-      /@escaping/,
+      /URLSession.*completionHandler.*\{/,
     ];
 
     const isEscapingContext = escapingPatterns.some((p) => p.test(trimmed));
@@ -217,12 +257,15 @@ function detectStrongSelfInClosures(lines: string[], filePath: string, isClass: 
 /**
  * Detect delegates/datasources not declared as weak.
  */
-function detectStrongDelegates(lines: string[], filePath: string, isProtocol: boolean): RetainIssue[] {
+function detectStrongDelegates(lines: string[], filePath: string, lineScopes: TypeKind[]): RetainIssue[] {
   const issues: RetainIssue[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     const trimmed = lines[i].trim();
     if (trimmed.startsWith("//")) continue;
+    // Only flag delegates inside class/actor — structs don't have retain cycles
+    const scope = lineScopes[i];
+    if (scope !== "class" && scope !== "actor") continue;
     // Skip protocol requirements and computed properties
     if (isComputedOrProtocolProperty(trimmed)) continue;
 
@@ -358,7 +401,7 @@ function detectNotificationCenterLeaks(lines: string[], filePath: string): Retai
 /**
  * Detect ViewController ↔ ViewModel strong reference patterns.
  */
-function detectViewModelRetainCycles(lines: string[], filePath: string, source: string, isProtocol: boolean): RetainIssue[] {
+function detectViewModelRetainCycles(lines: string[], filePath: string, source: string, lineScopes: TypeKind[]): RetainIssue[] {
   const issues: RetainIssue[] = [];
 
   // Check if this is a ViewModel that holds a strong reference to a ViewController
@@ -368,6 +411,9 @@ function detectViewModelRetainCycles(lines: string[], filePath: string, source: 
     for (let i = 0; i < lines.length; i++) {
       const trimmed = lines[i].trim();
       if (trimmed.startsWith("//")) continue;
+      // Only flag inside class/actor — struct ViewModel doesn't have retain cycles
+      const scope = lineScopes[i];
+      if (scope !== "class" && scope !== "actor") continue;
       // Skip protocol requirements and computed properties
       if (isComputedOrProtocolProperty(trimmed)) continue;
 
@@ -452,9 +498,9 @@ function detectDispatchWorkRetainCycles(lines: string[], filePath: string): Reta
 /**
  * Detect stored closure properties in classes that could capture self.
  */
-function detectStrongClosureProperties(lines: string[], filePath: string, isClass: boolean): RetainIssue[] {
+function detectStrongClosureProperties(lines: string[], filePath: string, lineScopes: TypeKind[]): RetainIssue[] {
   const issues: RetainIssue[] = [];
-  if (!isClass) return issues;
+  if (!lineScopes.some((s) => s === "class" || s === "actor")) return issues;
 
   for (let i = 0; i < lines.length; i++) {
     const trimmed = lines[i].trim();
@@ -466,6 +512,8 @@ function detectStrongClosureProperties(lines: string[], filePath: string, isClas
     );
 
     if (closurePropMatch && !trimmed.includes("weak")) {
+      // Only flag inside class/actor
+      if (lineScopes[i] !== "class" && lineScopes[i] !== "actor") continue;
       issues.push({
         filePath,
         line: i + 1,
