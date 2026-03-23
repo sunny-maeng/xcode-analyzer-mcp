@@ -20,9 +20,9 @@ export function createServer(): McpServer {
     {
       projectPath: z.string().describe("Path to the Xcode project root directory"),
       level: z
-        .enum(["module", "file"])
+        .enum(["module", "file", "type"])
         .optional()
-        .describe("Analysis level: 'module' for module-level, 'file' for file-level (default: module)"),
+        .describe("Analysis level: 'module' for module-level, 'file' for file-level, 'type' for class/struct circular references and retain cycles (default: module)"),
       excludePatterns: z
         .array(z.string())
         .optional()
