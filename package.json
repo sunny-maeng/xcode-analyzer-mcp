@@ -1,0 +1,45 @@
+{
+  "name": "xcode-analyzer-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for analyzing Xcode project dependencies, build times, and code health",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "xcode-analyzer-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "xcode",
+    "swift",
+    "ios",
+    "dependency-analysis",
+    "build-time",
+    "circular-dependency",
+    "model-context-protocol"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "fast-glob": "^3.3.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}
