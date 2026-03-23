@@ -6,6 +6,7 @@ import { analyzeImportGraph } from "./analyzers/import-graph.js";
 import { detectUnusedImports } from "./analyzers/unused-imports.js";
 import { analyzeDependencyTree } from "./analyzers/dependency-tree.js";
 import { analyzeLargeFiles } from "./analyzers/large-files.js";
+import { analyzeRetainCycles } from "./analyzers/retain-cycle.js";
 
 export function createServer(): McpServer {
   const server = new McpServer({
@@ -222,6 +223,38 @@ export function createServer(): McpServer {
           thresholdKB: thresholdKB ?? 500,
           categories: categories ?? ["all"],
           checkXcassets: checkXcassets ?? true,
+        });
+        return { content: [{ type: "text", text: result }] };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // Tool 7: Memory Leak & Retain Cycle Detection
+  server.tool(
+    "detect_retain_cycles",
+    "Detect potential memory leaks and retain cycles in Swift code. Finds: missing [weak self] in closures, strong delegates, Timer retain cycles, NotificationCenter leaks, ViewModel↔ViewController strong references, and stored closure properties.",
+    {
+      projectPath: z.string().describe("Path to the Xcode project root directory"),
+      targetPaths: z
+        .array(z.string())
+        .optional()
+        .describe("Specific files/directories to analyze (default: entire project)"),
+      excludePatterns: z
+        .array(z.string())
+        .optional()
+        .describe("Glob patterns to exclude"),
+    },
+    async ({ projectPath, targetPaths, excludePatterns }) => {
+      try {
+        const result = await analyzeRetainCycles({
+          projectPath,
+          targetPaths: targetPaths ?? undefined,
+          excludePatterns: excludePatterns ?? [],
         });
         return { content: [{ type: "text", text: result }] };
       } catch (err) {
